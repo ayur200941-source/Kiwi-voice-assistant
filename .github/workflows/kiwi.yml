@@ -1,0 +1,478 @@
+name: Build Kiwi APK
+
+on:
+  push:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create the Android project files
+        run: |
+          mkdir -p app/src/main/java/com/example/voicelock app/src/main/res/xml app/src/main/assets
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Kiwi"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.voicelock"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.voicelock"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 2
+                  versionName = "2.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("net.java.dev.jna:jna:5.13.0@aar")
+              implementation("com.alphacephei:vosk-android:0.3.47")
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.INTERNET" />
+              <uses-permission android:name="android.permission.RECORD_AUDIO" />
+              <uses-permission android:name="android.permission.WAKE_LOCK" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+              <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+
+              <queries>
+                  <intent>
+                      <action android:name="android.speech.RecognitionService" />
+                  </intent>
+                  <intent>
+                      <action android:name="android.intent.action.TTS_SERVICE" />
+                  </intent>
+              </queries>
+
+              <application
+                  android:label="Kiwi"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver
+                      android:name=".AdminReceiver"
+                      android:exported="true"
+                      android:permission="android.permission.BIND_DEVICE_ADMIN">
+                      <meta-data
+                          android:name="android.app.device_admin"
+                          android:resource="@xml/device_admin" />
+                      <intent-filter>
+                          <action android:name="android.app.action.DEVICE_ADMIN_ENABLED" />
+                      </intent-filter>
+                  </receiver>
+
+                  <service
+                      android:name=".VoiceService"
+                      android:exported="false"
+                      android:foregroundServiceType="microphone" />
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/res/xml/device_admin.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <device-admin>
+              <uses-policies>
+                  <force-lock />
+              </uses-policies>
+          </device-admin>
+          EOF
+
+          cat > app/src/main/java/com/example/voicelock/AdminReceiver.kt <<'EOF'
+          package com.example.voicelock
+
+          import android.app.admin.DeviceAdminReceiver
+
+          class AdminReceiver : DeviceAdminReceiver()
+          EOF
+
+          cat > app/src/main/java/com/example/voicelock/MainActivity.kt <<'EOF'
+          package com.example.voicelock
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.os.Build
+          import android.os.Bundle
+          import android.widget.Button
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+
+          class MainActivity : Activity() {
+
+              private lateinit var status: TextView
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = getSharedPreferences("kiwi", MODE_PRIVATE)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(48, 96, 48, 48)
+                  }
+                  val title = TextView(this).apply {
+                      text = "Kiwi voice assistant"
+                      textSize = 26f
+                  }
+                  val info = TextView(this).apply {
+                      text = "1. Paste your Gemini API key and press Save.\n" +
+                          "2. Press Start Kiwi.\n" +
+                          "3. Say \"Hey Kiwi\", wait for the beep, then ask anything.\n\n" +
+                          "Phone control: say \"lock screen\" or \"turn on screen\" after Hey Kiwi."
+                      textSize = 16f
+                      setPadding(0, 24, 0, 24)
+                  }
+                  val keyBox = EditText(this).apply {
+                      hint = "Paste Gemini API key here"
+                      setSingleLine(true)
+                      setText(prefs.getString("key", ""))
+                  }
+                  status = TextView(this).apply {
+                      textSize = 16f
+                      setPadding(0, 24, 0, 0)
+                  }
+                  val save = Button(this).apply {
+                      text = "Save key"
+                      setOnClickListener {
+                          prefs.edit().putString("key", keyBox.text.toString().trim()).apply()
+                          status.text = "Key saved."
+                      }
+                  }
+                  val start = Button(this).apply {
+                      text = "Start Kiwi"
+                      setOnClickListener { begin() }
+                  }
+                  val stop = Button(this).apply {
+                      text = "Stop Kiwi"
+                      setOnClickListener {
+                          stopService(Intent(this@MainActivity, VoiceService::class.java))
+                          status.text = "Kiwi stopped."
+                      }
+                  }
+
+                  root.addView(title)
+                  root.addView(info)
+                  root.addView(keyBox)
+                  root.addView(save)
+                  root.addView(start)
+                  root.addView(stop)
+                  root.addView(status)
+                  setContentView(ScrollView(this).apply { addView(root) })
+              }
+
+              private fun begin() {
+                  val needed = mutableListOf<String>()
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) != PackageManager.PERMISSION_GRANTED)
+                      needed.add(Manifest.permission.RECORD_AUDIO)
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED)
+                      needed.add(Manifest.permission.POST_NOTIFICATIONS)
+                  if (needed.isNotEmpty()) {
+                      requestPermissions(needed.toTypedArray(), 1)
+                      return
+                  }
+                  afterPermissions()
+              }
+
+              override fun onRequestPermissionsResult(code: Int, perms: Array<out String>, results: IntArray) {
+                  super.onRequestPermissionsResult(code, perms, results)
+                  if (checkSelfPermission(Manifest.permission.RECORD_AUDIO) == PackageManager.PERMISSION_GRANTED) {
+                      afterPermissions()
+                  } else {
+                      status.text = "Microphone permission is needed. Please allow it and press Start again."
+                  }
+              }
+
+              private fun afterPermissions() {
+                  val dpm = getSystemService(DEVICE_POLICY_SERVICE) as DevicePolicyManager
+                  val admin = ComponentName(this, AdminReceiver::class.java)
+                  if (!dpm.isAdminActive(admin)) {
+                      startActivityForResult(
+                          Intent(DevicePolicyManager.ACTION_ADD_DEVICE_ADMIN)
+                              .putExtra(DevicePolicyManager.EXTRA_DEVICE_ADMIN, admin), 2
+                      )
+                  } else {
+                      startKiwi()
+                  }
+              }
+
+              override fun onActivityResult(req: Int, res: Int, data: Intent?) {
+                  super.onActivityResult(req, res, data)
+                  if (req == 2) startKiwi()
+              }
+
+              private fun startKiwi() {
+                  startForegroundService(Intent(this, VoiceService::class.java))
+                  status.text = "Kiwi is starting. When the notification says Listening, say Hey Kiwi."
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/voicelock/VoiceService.kt <<'EOF'
+          package com.example.voicelock
+
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.Service
+          import android.app.admin.DevicePolicyManager
+          import android.content.ComponentName
+          import android.content.Intent
+          import android.content.pm.ServiceInfo
+          import android.os.Build
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.IBinder
+          import android.os.Looper
+          import android.os.PowerManager
+          import android.speech.RecognitionListener
+          import android.speech.RecognizerIntent
+          import android.speech.SpeechRecognizer
+          import android.speech.tts.TextToSpeech
+          import android.speech.tts.UtteranceProgressListener
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import org.vosk.Model
+          import org.vosk.Recognizer
+          import org.vosk.android.SpeechService
+          import org.vosk.android.StorageService
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.util.Locale
+          import org.vosk.android.RecognitionListener as VoskListener
+
+          class VoiceService : Service() {
+
+              private val main = Handler(Looper.getMainLooper())
+              private lateinit var nm: NotificationManager
+              private var model: Model? = null
+              private var speechService: SpeechService? = null
+              private var recognizer: SpeechRecognizer? = null
+              private var tts: TextToSpeech? = null
+              private var ttsReady = false
+              private var busy = false
+              private var destroyed = false
+              private var wakeLock: PowerManager.WakeLock? = null
+              private val history = JSONArray()
+
+              private val systemPrompt =
+                  "You are Kiwi, a friendly voice assistant on a phone. Answer in one to three short " +
+                  "sentences of plain spoken text. No markdown, no lists, no emojis. " +
+                  "Reply in the same language the user speaks."
+
+              override fun onCreate() {
+                  super.onCreate()
+                  nm = getSystemService(NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("vl", "Kiwi", NotificationManager.IMPORTANCE_LOW)
+                  )
+                  val n = buildNotif("Loading voice model...")
+                  if (Build.VERSION.SDK_INT >= 30)
+                      startForeground(1, n, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
+                  else startForeground(1, n)
+
+                  val pm = getSystemService(POWER_SERVICE) as PowerManager
+                  wakeLock = pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "kiwi:listen").apply {
+                      setReferenceCounted(false)
+                      acquire()
+                  }
+
+                  tts = TextToSpeech(this) { st ->
+                      if (st == TextToSpeech.SUCCESS) {
+                          ttsReady = true
+                          tts?.language = Locale("en", "IN")
+                          tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+                              override fun onStart(id: String?) {}
+                              override fun onDone(id: String?) { main.post { startWake() } }
+                              @Deprecated("Deprecated in Java")
+                              override fun onError(id: String?) { main.post { startWake() } }
+                          })
+                      }
+                  }
+
+                  StorageService.unpack(this, "model", "model",
+                      { m ->
+                          model = m
+                          startWake()
+                      },
+                      { e ->
+                          updateNotif("Model error: " + e.message)
+                      })
+              }
+
+              private fun buildNotif(text: String): Notification =
+                  Notification.Builder(this, "vl")
+                      .setContentTitle("Kiwi")
+                      .setContentText(text)
+                      .setSmallIcon(android.R.drawable.ic_btn_speak_now)
+                      .setOngoing(true)
+                      .build()
+
+              private fun updateNotif(text: String) {
+                  nm.notify(1, buildNotif(text))
+              }
+
+              // ---------- Stage 1: offline wake word "Hey Kiwi" ----------
+
+              private fun stopWake() {
+                  try { speechService?.stop() } catch (e: Exception) {}
+                  try { speechService?.shutdown() } catch (e: Exception) {}
+                  speechService = null
+              }
+
+              private fun startWake() {
+                  if (destroyed) return
+                  val m = model ?: return
+                  busy = false
+                  stopWake()
+                  val old = recognizer
+                  recognizer = null
+                  main.post { try { old?.destroy() } catch (e: Exception) {} }
+                  try {
+                      val rec = Recognizer(m, 16000.0f, "[\"hey kiwi\", \"hi kiwi\", \"kiwi\", \"[unk]\"]")
+                      val ss = SpeechService(rec, 16000.0f)
+                      ss.startListening(object : VoskListener {
+                          override fun onPartialResult(hyp: String?) {
+                              if (hyp != null && hyp.contains("kiwi")) woke()
+                          }
+                          override fun onResult(hyp: String?) {
+                              if (hyp != null && hyp.contains("kiwi")) woke()
+                          }
+                          override fun onFinalResult(hyp: String?) {}
+                          override fun onError(e: Exception?) {
+                              main.postDelayed({ startWake() }, 2000)
+                          }
+                          override fun onTimeout() {}
+                      })
+                      speechService = ss
+                      updateNotif("Listening for \"Hey Kiwi\"")
+                  } catch (e: Exception) {
+                      updateNotif("Mic error: " + e.message)
+                      main.postDelayed({ startWake() }, 3000)
+                  }
+              }
+
+              private fun woke() {
+                  if (busy) return
+                  busy = true
+                  stopWake()
+                  updateNotif("Listening to you...")
+                  main.postDelayed({ listenCommand() }, 400)
+              }
+
+              // ---------- Stage 2: listen to the question ----------
+
+              private fun listenCommand() {
+                  if (destroyed) return
+                  if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+                      speak("Speech service is not available on this phone.")
+                      return
+                  }
+                  val r = SpeechRecognizer.createSpeechRecognizer(this)
+                  recognizer = r
+                  r.setRecognitionListener(object : RecognitionListener {
+                      override fun onResults(results: Bundle?) {
+                          val text = results?.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION)
+                              ?.firstOrNull().orEmpty()
+                          if (text.isBlank()) startWake() else handle(text)
+                      }
+                      override fun onError(error: Int) { startWake() }
+                      override fun onReadyForSpeech(p: Bundle?) {}
+                      override fun onBeginningOfSpeech() {}
+                      override fun onRmsChanged(v: Float) {}
+                      override fun onBufferReceived(b: ByteArray?) {}
+                      override fun onEndOfSpeech() {}
+                      override fun onPartialResults(p: Bundle?) {}
+                      override fun onEvent(t: Int, p: Bundle?) {}
+                  })
+                  r.startListening(
+                      Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE_MODEL, RecognizerIntent.LANGUAGE_MODEL_FREE_FORM)
+                          .putExtra(RecognizerIntent.EXTRA_LANGUAGE, "en-IN")
+                  )
+              }
+
+              private fun handle(text: String) {
+                  val t = text.lowercase()
+                  updateNotif("You: " + text)
+                  when {
+                      t.contains("unlock") ->
+                          speak("Sorry, I can't unlock your phone. Please use your PIN or fingerprint.")
+                      t.contains("turn on screen") || t.contains("screen on") || t.contains("wake up") -> {
+                          wakeScreen()
+                          startWake()
+                      }
+                      Regex("\\block\\b").containsMatchIn(t) || t.contains("screen off") || t.contains("turn off screen") -> {
+                          lockScree
