@@ -1,0 +1,459 @@
+name: Build Planner APK
+
+on:
+  push:
+    paths:
+      - '.github/workflows/planner.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Create the Android project files
+        run: |
+          mkdir -p app/src/main/java/com/example/planner
+
+          cat > settings.gradle.kts <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "Planner"
+          include(":app")
+          EOF
+
+          cat > build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          EOF
+
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx2g
+          android.useAndroidX=true
+          EOF
+
+          cat > app/build.gradle.kts <<'EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.planner"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.planner"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+
+              <application
+                  android:label="Daily Plan"
+                  android:theme="@android:style/Theme.Material.Light">
+
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+
+                  <receiver android:name=".ReminderReceiver" android:exported="false" />
+
+                  <receiver android:name=".BootReceiver" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/java/com/example/planner/Core.kt <<'EOF'
+          package com.example.planner
+
+          import android.app.AlarmManager
+          import android.app.Notification
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.content.SharedPreferences
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.text.SimpleDateFormat
+          import java.util.Calendar
+          import java.util.Date
+          import java.util.Locale
+
+          object Store {
+              class Task(val id: Long, var title: String, var done: Boolean)
+
+              fun prefs(c: Context): SharedPreferences =
+                  c.getSharedPreferences("planner", Context.MODE_PRIVATE)
+
+              fun today(): String = SimpleDateFormat("yyyy-MM-dd", Locale.US).format(Date())
+
+              fun load(c: Context): MutableList<Task> {
+                  val arr = JSONArray(prefs(c).getString("tasks", "[]"))
+                  val out = mutableListOf<Task>()
+                  for (i in 0 until arr.length()) {
+                      val o = arr.getJSONObject(i)
+                      out.add(Task(o.getLong("id"), o.getString("title"), o.getBoolean("done")))
+                  }
+                  return out
+              }
+
+              fun save(c: Context, tasks: List<Task>) {
+                  val arr = JSONArray()
+                  for (t in tasks) {
+                      arr.put(JSONObject().put("id", t.id).put("title", t.title).put("done", t.done))
+                  }
+                  prefs(c).edit().putString("tasks", arr.toString()).apply()
+              }
+
+              // New day: untick everything so the list starts fresh.
+              fun rollover(c: Context) {
+                  val p = prefs(c)
+                  val t = today()
+                  if (p.getString("last", "") != t) {
+                      val tasks = load(c)
+                      for (task in tasks) task.done = false
+                      save(c, tasks)
+                      p.edit().putString("last", t).apply()
+                  }
+              }
+
+              fun doneDates(c: Context): MutableSet<String> {
+                  val arr = JSONArray(prefs(c).getString("done_dates", "[]"))
+                  val s = mutableSetOf<String>()
+                  for (i in 0 until arr.length()) s.add(arr.getString(i))
+                  return s
+              }
+
+              // A day counts for the streak when every task of that day is ticked.
+              fun updateToday(c: Context, tasks: List<Task>) {
+                  val s = doneDates(c)
+                  val t = today()
+                  if (tasks.isNotEmpty() && tasks.all { it.done }) s.add(t) else s.remove(t)
+                  val arr = JSONArray()
+                  for (d in s.sorted().takeLast(400)) arr.put(d)
+                  prefs(c).edit().putString("done_dates", arr.toString()).apply()
+              }
+
+              fun streak(c: Context): Int {
+                  val s = doneDates(c)
+                  val fmt = SimpleDateFormat("yyyy-MM-dd", Locale.US)
+                  val cal = Calendar.getInstance()
+                  if (fmt.format(cal.time) !in s) cal.add(Calendar.DAY_OF_YEAR, -1)
+                  var n = 0
+                  while (fmt.format(cal.time) in s) {
+                      n++
+                      cal.add(Calendar.DAY_OF_YEAR, -1)
+                  }
+                  return n
+              }
+          }
+
+          object Reminders {
+              // Schedules the next reminder at the top of the next hour.
+              fun schedule(c: Context) {
+                  val am = c.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val pi = PendingIntent.getBroadcast(
+                      c, 100, Intent(c, ReminderReceiver::class.java),
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  if (!Store.prefs(c).getBoolean("remind", true)) {
+                      am.cancel(pi)
+                      return
+                  }
+                  val cal = Calendar.getInstance()
+                  cal.add(Calendar.HOUR_OF_DAY, 1)
+                  cal.set(Calendar.MINUTE, 0)
+                  cal.set(Calendar.SECOND, 0)
+                  cal.set(Calendar.MILLISECOND, 0)
+                  am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+              }
+
+              fun post(c: Context) {
+                  val tasks = Store.load(c)
+                  val pending = tasks.filter { !it.done }
+                  val text = when {
+                      tasks.isEmpty() -> "Plan your day: add your tasks in the app."
+                      pending.isEmpty() -> "All done today! Streak: " + Store.streak(c) + " days"
+                      else -> pending.size.toString() + " left: " + pending.take(3).joinToString(", ") { it.title }
+                  }
+                  val nm = c.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                  nm.createNotificationChannel(
+                      NotificationChannel("reminders", "Plan reminders", NotificationManager.IMPORTANCE_DEFAULT)
+                  )
+                  val open = PendingIntent.getActivity(
+                      c, 0, Intent(c, MainActivity::class.java),
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+                  val n = Notification.Builder(c, "reminders")
+                      .setContentTitle("Daily plan")
+                      .setContentText(text)
+                      .setStyle(Notification.BigTextStyle().bigText(text))
+                      .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                      .setContentIntent(open)
+                      .setAutoCancel(true)
+                      .build()
+                  nm.notify(1, n)
+              }
+          }
+
+          class ReminderReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent?) {
+                  Store.rollover(c)
+                  Reminders.schedule(c)
+                  if (!Store.prefs(c).getBoolean("remind", true)) return
+                  val h = Calendar.getInstance().get(Calendar.HOUR_OF_DAY)
+                  if (h in 7..22) Reminders.post(c)
+              }
+          }
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(c: Context, i: Intent?) {
+                  Reminders.schedule(c)
+              }
+          }
+          EOF
+
+          cat > app/src/main/java/com/example/planner/MainActivity.kt <<'EOF'
+          package com.example.planner
+
+          import android.Manifest
+          import android.app.Activity
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Paint
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.view.Gravity
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.CheckBox
+          import android.widget.EditText
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var listBox: LinearLayout
+              private lateinit var streakView: TextView
+              private lateinit var progressView: TextView
+              private var tasks: MutableList<Store.Task> = mutableListOf()
+
+              private fun dp(n: Int) = (n * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val prefs = Store.prefs(this)
+
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(32), dp(16), dp(16))
+                  }
+                  root.addView(TextView(this).apply {
+                      text = "My Daily Plan"
+                      textSize = 26f
+                  })
+                  streakView = TextView(this).apply {
+                      textSize = 20f
+                      setPadding(0, dp(8), 0, 0)
+                  }
+                  progressView = TextView(this).apply {
+                      textSize = 16f
+                      setPadding(0, dp(4), 0, dp(12))
+                  }
+                  root.addView(streakView)
+                  root.addView(progressView)
+
+                  listBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+                  root.addView(listBox)
+
+                  val newTask = EditText(this).apply {
+                      hint = "New task (e.g. 6:30 Wake up)"
+                      setSingleLine(true)
+                  }
+                  val add = Button(this).apply {
+                      text = "Add task"
+                      setOnClickListener {
+                          val title = newTask.text.toString().trim()
+                          if (title.isNotEmpty()) {
+                              tasks.add(Store.Task(System.currentTimeMillis(), title, false))
+                              Store.save(this@MainActivity, tasks)
+                              newTask.setText("")
+                              render()
+                          }
+                      }
+                  }
+                  root.addView(newTask)
+                  root.addView(add)
+
+                  // Spotify: opens the playlist link in the Spotify app.
+                  val link = EditText(this).apply {
+                      hint = "Spotify playlist link"
+                      setSingleLine(true)
+                      setText(prefs.getString("spotify", ""))
+                  }
+                  val saveLink = Button(this).apply {
+                      text = "Save playlist link"
+                      setOnClickListener {
+                          prefs.edit().putString("spotify", link.text.toString().trim()).apply()
+                          Toast.makeText(this@MainActivity, "Saved", Toast.LENGTH_SHORT).show()
+                      }
+                  }
+                  val music = Button(this).apply {
+                      text = "Workout music"
+                      setOnClickListener {
+                          val l = prefs.getString("spotify", "").orEmpty().ifBlank { "https://open.spotify.com" }
+                          try {
+                              startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(l)))
+                          } catch (e: Exception) {
+                              Toast.makeText(this@MainActivity, "Could not open Spotify", Toast.LENGTH_SHORT).show()
+                          }
+                      }
+                  }
+                  root.addView(TextView(this).apply { setPadding(0, dp(16), 0, 0) })
+                  root.addView(link)
+                  root.addView(saveLink)
+                  root.addView(music)
+
+                  val remind = Button(this)
+                  fun refreshRemind() {
+                      remind.text = "Hourly reminders: " + if (prefs.getBoolean("remind", true)) "ON" else "OFF"
+                  }
+                  remind.setOnClickListener {
+                      prefs.edit().putBoolean("remind", !prefs.getBoolean("remind", true)).apply()
+                      Reminders.schedule(this)
+                      refreshRemind()
+                  }
+                  refreshRemind()
+                  val test = Button(this).apply {
+                      text = "Send test reminder now"
+                      setOnClickListener { Reminders.post(this@MainActivity) }
+                  }
+                  root.addView(remind)
+                  root.addView(test)
+
+                  setContentView(ScrollView(this).apply { addView(root) })
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS) != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+                  Reminders.schedule(this)
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  Store.rollover(this)
+                  tasks = Store.load(this)
+                  render()
+              }
+
+              private fun render() {
+                  listBox.removeAllViews()
+                  for (t in tasks) {
+                      val row = LinearLayout(this).apply {
+                          orientation = LinearLayout.HORIZONTAL
+                          gravity = Gravity.CENTER_VERTICAL
+                      }
+                      val cb = CheckBox(this).apply {
+                          text = t.title
+                          textSize = 18f
+                          isChecked = t.done
+                          paintFlags = if (t.done) paintFlags or Paint.STRIKE_THRU_TEXT_FLAG
+                          else paintFlags and Paint.STRIKE_THRU_TEXT_FLAG.inv()
+                          setOnCheckedChangeListener { _, checked ->
+                              t.done = checked
+                              Store.save(this@MainActivity, tasks)
+                              Store.updateToday(this@MainActivity, tasks)
+                              listBox.post { render() }
+                          }
+                      }
+                      val del = Button(this).apply {
+                          text = "X"
+                          setOnClickListener {
+                              tasks.remove(t)
+                              Store.save(this@MainActivity, tasks)
+                              Store.updateToday(this@MainActivity, tasks)
+                              render()
+                          }
+                      }
+                      row.addView(cb, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                      row.addView(del)
+                      listBox.addView(row)
+                  }
+                  val done = tasks.count { it.done }
+                  progressView.text = "Today: " + done + " / " + tasks.size + " done" +
+                      (if (tasks.isNotEmpty() && done == tasks.size) "  - All done!" else "")
+                  streakView.text = "Streak: " + Store.streak(this) + " days"
+              }
+          }
+          EOF
+
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.7
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+
+      - name: Publish APK to Releases
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: planner-${{ github.run_number }}
+          name: Planner APK ${{ github.run_number }}
+          files: app/build/outputs/apk/debug/app-debug.apk
+          
